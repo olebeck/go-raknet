@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
 
 	"github.com/sandertv/go-raknet/internal/message"
 )
@@ -141,6 +142,9 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 		return nil, dialer.error("ping", err)
 	}
 
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetReadDeadline(deadline)
+	}
 	data = make([]byte, 1492)
 	n, err := conn.Read(data)
 	if err != nil {
@@ -238,6 +242,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 	if err := conn.send((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
+	state.conn.SetReadDeadline(time.Time{})
 
 	go dialer.clientListen(conn, state.conn)
 

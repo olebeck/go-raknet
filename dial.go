@@ -217,7 +217,7 @@ func (dialer Dialer) DialTimeout(address string, timeout time.Duration) (*Conn, 
 // context.Context is closed.
 func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, error) {
 	if dialer.ErrorLog == nil {
-		dialer.ErrorLog = slog.New(internal.DiscardHandler{})
+		dialer.ErrorLog = slog.Default() //slog.New(internal.DiscardHandler{})
 	}
 
 	conn, err := dialer.dial(ctx, address)
@@ -264,7 +264,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
-	b := make([]byte, rakConn.effectiveMTU())
+	b := make([]byte, rakConn.effectiveMTU()+0x100)
 	for {
 		n, err := conn.Read(b)
 		if err == nil && n != 0 {

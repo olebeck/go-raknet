@@ -97,6 +97,8 @@ type Dialer struct {
 	// UpstreamDialer is a dialer that will override the default dialer for
 	// opening outgoing connections. The default is a net.Dial("udp", ...).
 	UpstreamDialer UpstreamDialer
+
+	FixupMaxMTU uint16
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -224,7 +226,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
-	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
+	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2), fixmeMaxMTU: dialer.FixupMaxMTU}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
 		return nil, dialer.error("dial", err)
@@ -290,6 +292,9 @@ type connState struct {
 	// 1 packet. It is the MTU size sent by the server.
 	mtu uint16
 
+	// for when server says it can do more mtu than it actually can
+	fixmeMaxMTU uint16
+
 	serverSecurity bool
 	cookie         uint32
 
@@ -331,7 +336,11 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 				state.openConnectionRequest2(response.MTU)
 				continue
 			}
-			state.mtu = response.MTU
+			if state.fixmeMaxMTU != 0 {
+				state.mtu = min(response.MTU, state.fixmeMaxMTU)
+			} else {
+				state.mtu = response.MTU
+			}
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}

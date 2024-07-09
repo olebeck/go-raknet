@@ -5,8 +5,6 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
-	"github.com/sandertv/go-raknet/internal/message"
 	"io"
 	"net"
 	"net/netip"
@@ -14,6 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 const (
@@ -87,6 +88,8 @@ type Conn struct {
 	retransmission *resendMap
 
 	lastActivity atomic.Pointer[time.Time]
+
+	stats RakNetStatistics
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -116,10 +119,14 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 	return c
 }
 
+func (conn *Conn) Stats() RakNetStatistics {
+	return conn.stats
+}
+
 // effectiveMTU returns the mtu size without the space allocated for IP and
 // UDP headers (28 bytes).
 func (conn *Conn) effectiveMTU() uint16 {
-	return conn.mtu - 28
+	return conn.mtu - 28 - 8
 }
 
 // startTicking makes the connection start ticking, sending ACKs and pings to
@@ -261,6 +268,7 @@ func (conn *Conn) write(b []byte) (n int, err error) {
 			pk.splitIndex = uint32(splitIndex)
 			pk.splitID = splitID
 		}
+		conn.stats.addPacketSent(pk)
 		if err = conn.sendDatagram(pk); err != nil {
 			return 0, err
 		}
@@ -364,6 +372,7 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
+	conn.stats.addBytesReceived(len(b))
 
 	switch {
 	case b[0]&bitFlagACK != 0:
@@ -437,6 +446,9 @@ func (conn *Conn) handleDatagram(b []byte) error {
 // queue and takes out all packets that were obtainable after that, and handles
 // them.
 func (conn *Conn) receivePacket(packet *packet) error {
+	conn.stats.addPacketReceivedQueued(packet)
+	conn.stats.setWindowSize(int(conn.packetQueue.WindowSize()))
+
 	if packet.reliability != reliabilityReliableOrdered {
 		// If it isn't a reliable ordered packet, handle it immediately.
 		return conn.handlePacket(packet.content)
@@ -462,6 +474,7 @@ var errZeroPacket = errors.New("handle packet: zero packet length")
 // an error is returned. If the packet was not handled by RakNet, it is sent to
 // the packet channel.
 func (conn *Conn) handlePacket(b []byte) error {
+	conn.stats.addPacketReceivedProcessed(len(b))
 	if len(b) == 0 {
 		return errZeroPacket
 	}
@@ -535,6 +548,7 @@ func (conn *Conn) sendACK(packets ...uint24) error {
 // numbers passed. If not successful, an error is returned.
 func (conn *Conn) sendNACK(packets []uint24) error {
 	defer conn.nackBuf.Reset()
+	conn.stats.addPacketNack(len(packets))
 	return conn.sendAcknowledgement(packets, bitFlagNACK, conn.nackBuf)
 }
 
@@ -602,6 +616,7 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 		if !ok {
 			continue
 		}
+		conn.stats.addPacketResent(pk)
 		if err = conn.sendDatagram(pk); err != nil {
 			return err
 		}
@@ -633,6 +648,7 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 // is logged but not returned. This is done because at this stage, packets
 // being lost to an error can be recovered through resending.
 func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
+	conn.stats.addBytesWritten(len(p))
 	if _, err := conn.conn.WriteTo(p, raddr); errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("write to: %w", err)
 	} else if err != nil {

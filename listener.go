@@ -35,6 +35,9 @@ type ListenConfig struct {
 	// systems that interfere with this. In this case, DisableCookies should be
 	// set to true.
 	DisableCookies bool
+	// MaxMTU caps the largest MTU negotiated with incoming clients. If zero,
+	// the maximum supported MTU is used.
+	MaxMTU uint16
 	// BlockDuration specifies how long IP addresses should be blocked if an
 	// error is encountered during the handling of packets from an address.
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
@@ -69,6 +72,10 @@ type Listener struct {
 	// pongData is a byte slice of data that is sent in an unconnected pong
 	// packet each time the client sends and unconnected ping to the server.
 	pongData atomic.Pointer[[]byte]
+
+	// pongDataFunc is a function that returns the data that is sent in an unconnected pong
+	// it will be called if pongData is nil.
+	pongDataFunc atomic.Pointer[func(addr net.Addr) []byte]
 }
 
 // listenerID holds the next ID to use for a Listener.
@@ -88,6 +95,7 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if conf.BlockDuration == 0 {
 		conf.BlockDuration = time.Second * 10
 	}
+	conf.MaxMTU = clampMTU(conf.MaxMTU, minMTUSize)
 	var conn net.PacketConn
 	var err error
 
@@ -105,13 +113,13 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 		incoming: make(chan *Conn),
 		closed:   make(chan struct{}),
 		id:       atomic.AddInt64(&listenerID, 1),
-		sec:      newSecurity(conf),
 	}
-	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: rand.Uint32()}
+	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: &atomic.Uint64{}, previousSalt: &atomic.Uint64{}}
+	listener.sec = newSecurity(conf, listener.handler)
 	listener.pongData.Store(new([]byte))
 
 	go listener.listen()
-	go listener.sec.gc(listener.closed)
+	go listener.sec.tick(listener.closed)
 	return listener, nil
 }
 
@@ -165,10 +173,26 @@ func (listener *Listener) PongData(data []byte) {
 	listener.pongData.Store(&data)
 }
 
+// PongDataFunc sets a function to generate pong data dynamically when responding to an unconnected ping.
+// This function will take priority over the static pong data, unless it is set back to nil. The data
+// returned should not be bigger than math.MaxInt16.
+func (listener *Listener) PongDataFunc(f func(addr net.Addr) []byte) {
+	if f == nil {
+		listener.pongDataFunc.Store(nil)
+	} else {
+		listener.pongDataFunc.Store(&f)
+	}
+}
+
 // ID returns the unique ID of the listener. This ID is usually used by a
 // client to identify a specific server during a single session.
 func (listener *Listener) ID() int64 {
 	return listener.id
+}
+
+// maxMTU returns the listener's effective negotiated MTU cap.
+func (listener *Listener) maxMTU() uint16 {
+	return clampMTU(listener.conf.MaxMTU, minMTUSize)
 }
 
 // listen continuously reads from the listener's UDP connection, until closed
@@ -184,16 +208,24 @@ func (listener *Listener) listen() {
 				close(listener.incoming)
 				return
 			}
-			listener.conf.ErrorLog.Error("read from: " + err.Error())
+			listener.conf.ErrorLog.Error("read from: "+err.Error(), "raddr", addrToStr(addr))
 			continue
 		} else if n == 0 || listener.sec.blocked(addr) {
 			continue
 		}
 		if err = listener.handle(b[:n], addr); err != nil && !errors.Is(err, net.ErrClosed) {
-			listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addr.String(), "block-duration", max(0, listener.conf.BlockDuration))
+			listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrToStr(addr), "block-duration", max(0, listener.conf.BlockDuration))
 			listener.sec.block(addr)
 		}
 	}
+}
+
+// addrToStr calls addr.String if addr is non-nil or returns "unknown" if it is.
+func addrToStr(addr net.Addr) string {
+	if addr != nil {
+		return addr.String()
+	}
+	return "unknown"
 }
 
 // handle handles an incoming packet in buffer b from the address passed. If
@@ -221,6 +253,7 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 // Listener.
 type security struct {
 	conf ListenConfig
+	h    *listenerConnectionHandler
 
 	blockCount atomic.Uint32
 
@@ -229,20 +262,29 @@ type security struct {
 }
 
 // newSecurity uses settings from a ListenConfig to create a security.
-func newSecurity(conf ListenConfig) *security {
-	return &security{conf: conf, blocks: make(map[[16]byte]time.Time)}
+func newSecurity(conf ListenConfig, h *listenerConnectionHandler) *security {
+	h.cookieSalt.Store(rand.Uint64())
+	h.previousSalt.Store(rand.Uint64())
+	return &security{h: h, conf: conf, blocks: make(map[[16]byte]time.Time)}
 }
 
-// gc clears garbage from the security layer every second until the stop channel
-// passed is closed.
-func (s *security) gc(stop <-chan struct{}) {
+// tick clears garbage from the security layer every second until the stop
+// channel passed is closed. Additionally, it updates the salt used for
+// cookies.
+func (s *security) tick(stop <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	i := 0
 
 	for {
 		select {
 		case <-ticker.C:
 			s.gcBlocks()
+			if i++; i%2 == 0 {
+				// Update salt used to produce cookies every 2s.
+				s.h.previousSalt.Store(s.h.cookieSalt.Load())
+				s.h.cookieSalt.Store(rand.Uint64())
+			}
 		case <-stop:
 			return
 		}

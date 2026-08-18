@@ -97,6 +97,25 @@ type Dialer struct {
 	// UpstreamDialer is a dialer that will override the default dialer for
 	// opening outgoing connections. The default is a net.Dial("udp", ...).
 	UpstreamDialer UpstreamDialer
+
+	// MaxTransientErrors is the maximum number of transient errors to ignore
+	// before returning an error. These include errors that can occur on
+	// bad connections such as ECONNREFUSED, EHOSTUNREACH, ENETUNREACH, ECONNRESET.
+	// If there is no limit it will continue to retry reading until the context deadline.
+	// Default is 10. -1 means no limit.
+	// This is only used for the initial connection handshake.
+	MaxTransientErrors int
+
+	// MaxMTU caps the largest MTU value used during the connection
+	// handshake. If zero, probes start at the maximum supported MTU.
+	//
+	// Set this to your local interface MTU when it is below 1500 (for
+	// example 1400 on hosts behind a tunnel or VPN). With the default,
+	// the kernel will fragment the first probes into two IP packets, and
+	// some firewalls drop fragmented UDP and never deliver them to the
+	// server. Capping the MTU keeps every packet inside a single IP
+	// datagram for the entire connection.
+	MaxMTU uint16
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -145,7 +164,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetReadDeadline(deadline)
 	}
-	data = make([]byte, 1492)
+	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
 		return nil, dialer.error("ping", err)
@@ -183,7 +202,8 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 }
 
 // dialerID is a counter used to produce an ID for the client.
-var dialerID = rand.Int64()
+// This should always be negative as per the vanilla client implementation.
+var dialerID = -rand.Int64()
 
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
@@ -215,7 +235,10 @@ func (dialer Dialer) DialTimeout(address string, timeout time.Duration) (*Conn, 
 // context.Context is closed.
 func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, error) {
 	if dialer.ErrorLog == nil {
-		dialer.ErrorLog = slog.Default() //slog.New(internal.DiscardHandler{})
+		dialer.ErrorLog = slog.New(internal.DiscardHandler{})
+	}
+	if dialer.MaxTransientErrors == 0 {
+		dialer.MaxTransientErrors = 10
 	}
 
 	conn, err := dialer.dial(ctx, address)
@@ -224,14 +247,20 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	}
 	dialer.ErrorLog = dialer.ErrorLog.With("src", "dialer", "raddr", conn.RemoteAddr().String())
 
-	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
+	cs := &connState{
+		conn:               conn,
+		raddr:              conn.RemoteAddr(),
+		id:                 atomic.AddInt64(&dialerID, 1),
+		ticker:             time.NewTicker(time.Second / 2),
+		maxTransientErrors: dialer.MaxTransientErrors,
+		maxMTU:             dialer.MaxMTU,
+	}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
-		return nil, dialer.error("dial", err)
+		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
 	} else if err = cs.openConnection(ctx); err != nil {
-		return nil, dialer.error("dial", err)
+		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
 	}
-
 	return dialer.connect(ctx, cs)
 }
 
@@ -262,7 +291,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
-	b := make([]byte, rakConn.effectiveMTU()+0x100)
+	b := make([]byte, maxMTUSize)
 	for {
 		n, err := conn.Read(b)
 		if err == nil && n != 0 {
@@ -290,13 +319,41 @@ type connState struct {
 	// 1 packet. It is the MTU size sent by the server.
 	mtu uint16
 
+	// maxMTU is copied from Dialer.MaxMTU and caps the probe sizes used
+	// during MTU discovery. Zero means use the defaults.
+	maxMTU uint16
+
 	serverSecurity bool
 	cookie         uint32
 
 	ticker *time.Ticker
+
+	transientErrorCount int
+	maxTransientErrors  int
 }
 
-var mtuSizes = []uint16{1492, 1200, 576}
+const minSupportedMTU = 576
+
+// mtuSizes is the default probe sequence used for MTU discovery.
+var mtuSizes = []uint16{maxMTUSize, 1200, minSupportedMTU}
+
+// mtuSizesFor returns the MTU values to probe with when starting a
+// connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
+// default list is returned. Otherwise the largest entry is replaced with
+// maxMTU and any default entries that are still smaller are kept after it.
+func mtuSizesFor(maxMTU uint16) []uint16 {
+	maxMTU = clampMTU(maxMTU, minSupportedMTU)
+	if maxMTU == maxMTUSize {
+		return mtuSizes
+	}
+	out := []uint16{maxMTU}
+	for _, s := range mtuSizes {
+		if s < maxMTU {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
@@ -305,16 +362,23 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go state.request1(ctx, mtuSizes)
+	go state.request1(ctx, mtuSizesFor(state.maxMTU))
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
 		n, err := state.conn.Read(b)
-		if err != nil || n == 0 {
+		if err != nil {
+			if isTransientUDPReadError(err) && (state.maxTransientErrors == -1 || state.transientErrorCount < state.maxTransientErrors) {
+				state.transientErrorCount++
+				continue
+			}
 			state.close()
 			return err
+		}
+		if n == 0 {
+			continue
 		}
 		switch b[0] {
 		case message.IDOpenConnectionReply1:
@@ -348,7 +412,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	state.ticker.Reset(time.Second / 2)
 	for _, size := range sizes {
-		for range 3 {
+		for range 4 {
 			state.openConnectionRequest1(size)
 			select {
 			case <-state.ticker.C:
@@ -368,14 +432,21 @@ func (state *connState) openConnection(ctx context.Context) error {
 
 	go state.request2(ctx, state.mtu)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.
 		n, err := state.conn.Read(b)
-		if err != nil || n == 0 {
+		if err != nil {
+			if isTransientUDPReadError(err) && (state.maxTransientErrors == -1 || state.transientErrorCount < state.maxTransientErrors) {
+				state.transientErrorCount++
+				continue
+			}
 			state.close()
 			return err
+		}
+		if n == 0 {
+			continue
 		}
 		if b[0] != message.IDOpenConnectionReply2 {
 			continue
